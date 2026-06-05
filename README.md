@@ -101,6 +101,8 @@ data. See the inline comments in `action.yml` for the full security rationale.
 
 ## Consumers
 
-- [ice-age-mono](https://github.com/AntarcticaAM/ice-age-mono) — `.github/workflows/dependabot-triage.yml`
-- [python-mono](https://github.com/AntarcticaAM/python-mono) — `.github/workflows/dependabot-triage.yml`
-- [aam-data-platform](https://github.com/AntarcticaAM/aam-data-platform) — `.github/workflows/dependabot-triage.yml`
+| Repo | PR | Branch target |
+|---|---|---|
+| [ice-age-mono](https://github.com/AntarcticaAM/ice-age-mono) | [#2343](https://github.com/AntarcticaAM/ice-age-mono/pull/2343) | `main` |
+| [python-mono](https://github.com/AntarcticaAM/python-mono) | [#3595](https://github.com/AntarcticaAM/python-mono/pull/3595) | `master` |
+| [aam-data-platform](https://github.com/AntarcticaAM/aam-data-platform) | [#625](https://github.com/AntarcticaAM/aam-data-platform/pull/625) | `master` |
