@@ -1,0 +1,407 @@
+# Why this action exists
+#
+# When dependabot opens a PR, a human must triage it: add labels, assign
+# reviewers, request a Codex review, alert the team on security updates, add
+# it to the vulnerability tracking project, and create a Linear issue. This
+# composite action automates all those steps so nothing is missed and the team
+# is notified consistently across repos.
+#
+# Security detection and SLA
+#
+# The action scans the PR body for advisory severity headers (Critical, High,
+# Moderate, Low) and routes to the matching SLA from the team policy:
+#   Critical  72 hours
+#   High      14 days
+#   Moderate  30 days
+#   Low       quarterly
+# Any GHSA advisory IDs found are listed in the security alert comment.
+# Regular dependency bumps (no severity header, no GHSA IDs) get the primary
+# reviewer, the Codex review comment, project tracking, and a routine Linear
+# issue.
+#
+# SECURITY: this action is designed for use in pull_request_target workflows.
+# pull_request_target runs with full secrets and write permissions on EVERY PR,
+# including from forks. It is only safe because:
+#   - this action does NOT check out PR code
+#   - this action does NOT execute any script from the PR
+#   - PR-controlled data (body, title) is read via inputs and treated as data
+# Callers: do NOT add `actions/checkout` with `ref: pull_request.head.sha`,
+# and do NOT pass PR-controlled content to shell commands without quoting.
+# Doing either would turn your workflow into an RCE surface.
+
+name: Dependabot PR triage
+description: >
+  Composite action that automates dependabot PR triage: labels, reviewers,
+  Codex review comment, security alerts, GitHub Projects tracking, and Linear
+  issue creation.
+
+inputs:
+  github-token:
+    description: GITHUB_TOKEN for PR comments, labels, and reviewer assignment
+    required: true
+  gh-project-token:
+    description: >
+      PAT with 'project' scope for org-level GitHub Projects writes. Falls back
+      to github-token if omitted, but GITHUB_TOKEN usually lacks project scope.
+    required: false
+    default: ''
+  linear-api-key:
+    description: >
+      Linear personal API key. The Linear issue creation step is skipped
+      automatically when this is absent.
+    required: false
+    default: ''
+  pr-number:
+    description: >
+      PR number to triage. Callers should resolve
+      `github.event.pull_request.number || inputs.pr_number` before passing.
+    required: true
+  dry-run:
+    description: >
+      When 'true', log what would happen without mutating labels, comments,
+      projects, or Linear.
+    required: false
+    default: 'false'
+  force:
+    description: >
+      When 'true', bypass the idempotency marker check and re-run all steps
+      even if triage was already applied.
+    required: false
+    default: 'false'
+  github-project-number:
+    description: >
+      Org-level GitHub project number to add the PR to. Set to the integer
+      project number (e.g. '51'). Step is skipped when empty.
+    required: false
+    default: ''
+  primary-reviewer:
+    description: GitHub username assigned as reviewer on every dependabot PR
+    required: false
+    default: 'LiamDeaconAntarcticaAM'
+  security-reviewer:
+    description: >
+      GitHub username added as a silent second reviewer on security PRs only.
+      Not @-mentioned in comments to avoid spam on recreate flows.
+    required: false
+    default: 'edwardconnect'
+  security-alert-mention:
+    description: GitHub username @-mentioned in the security alert comment body
+    required: false
+    default: 'LiamDeaconAntarcticaAM'
+  linear-team-id:
+    description: Linear team UUID for issue creation
+    required: false
+    default: 'a7cd5cb3-15cf-43c3-ae1e-f51f435ec982'
+  linear-project-id:
+    description: Linear project UUID for security issue creation
+    required: false
+    default: 'a7813bb0-501c-4720-bd63-2f7e885a656c'
+  linear-inreview-state-id:
+    description: Linear "In Review" state UUID (applied to security PRs)
+    required: false
+    default: '72d48148-a34f-4bb9-ad57-c40f02609dde'
+  linear-todo-state-id:
+    description: Linear "Todo" state UUID (applied to routine PRs)
+    required: false
+    default: 'd8bcab6a-fa23-4d75-8a16-04a385380f51'
+  linear-assignee-id:
+    description: Linear assignee UUID for created issues
+    required: false
+    default: 'ab6d344a-e6ba-4ee1-8a37-8138872b3c58'
+
+runs:
+  using: composite
+  steps:
+    # -------------------------------------------------------------------
+    # Step 1: snapshot PR metadata to local files.
+    # For pull_request_target the data is on the event payload (passed via
+    # env). For workflow_dispatch we fetch via gh API using pr-number.
+    # -------------------------------------------------------------------
+    - name: Snapshot PR metadata
+      shell: bash
+      env:
+        GH_TOKEN:  ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PR_BODY:   ${{ github.event.pull_request.body }}
+        PR_TITLE:  ${{ github.event.pull_request.title }}
+        PR_URL:    ${{ github.event.pull_request.html_url }}
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" > /tmp/pr.json
+          jq -r '.body  // ""' /tmp/pr.json > /tmp/pr_body.txt
+          jq -r '.title // ""' /tmp/pr.json > /tmp/pr_title.txt
+          jq -r '.html_url'    /tmp/pr.json > /tmp/pr_url.txt
+        else
+          printf '%s' "$PR_BODY"  > /tmp/pr_body.txt
+          printf '%s' "$PR_TITLE" > /tmp/pr_title.txt
+          printf '%s' "$PR_URL"   > /tmp/pr_url.txt
+        fi
+
+    # -------------------------------------------------------------------
+    # Step 2: idempotency check.
+    # If a prior run left the hidden marker comment, skip the mutating
+    # steps. force='true' bypasses.
+    # -------------------------------------------------------------------
+    - name: Idempotency check
+      id: idempotency
+      shell: bash
+      env:
+        GH_TOKEN:  ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        FORCE:     ${{ inputs.force }}
+      run: |
+        MARKER='<!-- dependabot-triage-applied -->'
+        if [ "$FORCE" = "true" ]; then
+          echo "::notice::FORCE=true, bypassing idempotency check"
+          echo "already=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" --paginate \
+           | jq -e --arg m "$MARKER" 'any(.[]; .body | contains($m))' > /dev/null; then
+          echo "::notice::Triage already applied to PR #${PR_NUMBER}; skipping mutations."
+          echo "already=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "already=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # -------------------------------------------------------------------
+    # Step 3: detect severity and advisory IDs.
+    # Picks the highest severity header present in the dependabot body.
+    # -------------------------------------------------------------------
+    - name: Detect severity and GHSAs
+      id: security
+      if: steps.idempotency.outputs.already == 'false'
+      shell: bash
+      run: |
+        BODY=$(cat /tmp/pr_body.txt)
+
+        GHSAS=$(printf '%s' "$BODY" \
+          | grep -oiE 'GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}' \
+          | sort -u)
+        printf '%s\n' "$GHSAS" > /tmp/ghsa_ids.txt
+        if [ -z "$GHSAS" ]; then
+          COUNT=0
+        else
+          COUNT=$(printf '%s\n' "$GHSAS" | grep -c .)
+        fi
+
+        HIGHEST=none
+        if   printf '%s' "$BODY" | grep -qiE '(^|[^A-Za-z])Critical:'; then
+          HIGHEST=Critical
+        elif printf '%s' "$BODY" | grep -qiE '(^|[^A-Za-z])High:'; then
+          HIGHEST=High
+        elif printf '%s' "$BODY" | grep -qiE '(^|[^A-Za-z])Moderate:'; then
+          HIGHEST=Moderate
+        elif printf '%s' "$BODY" | grep -qiE '(^|[^A-Za-z])Low:'; then
+          HIGHEST=Low
+        fi
+
+        if [ "$COUNT" -gt 0 ] || [ "$HIGHEST" != "none" ]; then
+          DETECTED=true
+        else
+          DETECTED=false
+        fi
+
+        case "$HIGHEST" in
+          Critical) SLA='72 hours (Critical)' ;;
+          High)     SLA='14 days (High)' ;;
+          Moderate) SLA='30 days (Moderate)' ;;
+          Low)      SLA='quarterly (Low)' ;;
+          *)        SLA='see PR body for severity' ;;
+        esac
+
+        {
+          echo "detected=$DETECTED"
+          echo "count=$COUNT"
+          echo "severity=$HIGHEST"
+          echo "sla=$SLA"
+        } >> "$GITHUB_OUTPUT"
+
+    # -------------------------------------------------------------------
+    # Step 4: labels. continue-on-error so a renamed label cannot halt
+    # the rest of the workflow.
+    # -------------------------------------------------------------------
+    - name: Add labels
+      if: steps.idempotency.outputs.already == 'false' && inputs.dry-run != 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN:    ${{ inputs.github-token }}
+        PR_NUMBER:   ${{ inputs.pr-number }}
+        IS_SECURITY: ${{ steps.security.outputs.detected }}
+      run: |
+        if [ "$IS_SECURITY" = "true" ]; then
+          gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
+            -X POST \
+            --field 'labels[]=security 🔒' \
+            --field 'labels[]=urgent ⏰' \
+            --field 'labels[]=cve 🛡️'
+        fi
+
+    # -------------------------------------------------------------------
+    # Step 5: reviewers. Security PRs add the security-reviewer alongside
+    # the primary; non-security PRs go to primary only.
+    # -------------------------------------------------------------------
+    - name: Add reviewers
+      if: steps.idempotency.outputs.already == 'false' && inputs.dry-run != 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN:          ${{ inputs.github-token }}
+        PR_NUMBER:         ${{ inputs.pr-number }}
+        IS_SECURITY:       ${{ steps.security.outputs.detected }}
+        PRIMARY_REVIEWER:  ${{ inputs.primary-reviewer }}
+        SECURITY_REVIEWER: ${{ inputs.security-reviewer }}
+      run: |
+        if [ "$IS_SECURITY" = "true" ]; then
+          gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/requested_reviewers" \
+            -X POST \
+            --field "reviewers[]=$PRIMARY_REVIEWER" \
+            --field "reviewers[]=$SECURITY_REVIEWER"
+        else
+          gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/requested_reviewers" \
+            -X POST \
+            --field "reviewers[]=$PRIMARY_REVIEWER"
+        fi
+
+    # -------------------------------------------------------------------
+    # Step 6: Codex review request for every dependabot PR.
+    # -------------------------------------------------------------------
+    - name: Post Codex review request
+      if: steps.idempotency.outputs.already == 'false' && inputs.dry-run != 'true'
+      shell: bash
+      env:
+        GH_TOKEN:  ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+      run: |
+        gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+          -X POST \
+          -f body='@codex review - summarise affected areas and highlight risk in a human readable tabular manner'
+
+    # -------------------------------------------------------------------
+    # Step 7: security alert comment. The security-reviewer is a silent
+    # reviewer (step 5) and is NOT @-mentioned here to avoid noise on
+    # PR recreate flows.
+    # -------------------------------------------------------------------
+    - name: Post security alert comment
+      if: >
+        steps.idempotency.outputs.already == 'false' &&
+        steps.security.outputs.detected == 'true' &&
+        inputs.dry-run != 'true'
+      shell: bash
+      env:
+        GH_TOKEN:        ${{ inputs.github-token }}
+        PR_NUMBER:       ${{ inputs.pr-number }}
+        CVE_COUNT:       ${{ steps.security.outputs.count }}
+        SEVERITY:        ${{ steps.security.outputs.severity }}
+        SLA:             ${{ steps.security.outputs.sla }}
+        ALERT_MENTION:   ${{ inputs.security-alert-mention }}
+      run: |
+        {
+          if [ "$CVE_COUNT" -gt 0 ]; then
+            printf '🚨 **Security Alert — severity: %s, %dx advisory ID(s)**\n\n' "$SEVERITY" "$CVE_COUNT"
+          else
+            printf '🚨 **Security Alert — severity: %s**\n\n' "$SEVERITY"
+          fi
+          printf '@%s — this PR is urgent. See the PR description above for full CVE details.\n\n' "$ALERT_MENTION"
+          printf '**SLA: %s**\n\n' "$SLA"
+          if [ -s /tmp/ghsa_ids.txt ] && [ "$CVE_COUNT" -gt 0 ]; then
+            printf 'Advisory IDs found:\n'
+            sed 's/^/- /' /tmp/ghsa_ids.txt
+          fi
+        } > /tmp/alert.md
+        gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+          -X POST \
+          -f body=@/tmp/alert.md
+
+    # -------------------------------------------------------------------
+    # Step 8: org-project tracking.
+    # Skipped when github-project-number is empty. Requires a PAT with
+    # 'project' scope (gh-project-token). Failure is logged via ::warning::
+    # but does not halt the workflow.
+    # -------------------------------------------------------------------
+    - name: Add to GitHub project
+      if: >
+        steps.idempotency.outputs.already == 'false' &&
+        inputs.dry-run != 'true' &&
+        inputs.github-project-number != ''
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN:      ${{ inputs.gh-project-token || inputs.github-token }}
+        PROJECT_NUMBER: ${{ inputs.github-project-number }}
+      run: |
+        PR_URL=$(cat /tmp/pr_url.txt)
+        if ! gh project item-add "$PROJECT_NUMBER" --owner "${{ github.repository_owner }}" --url "$PR_URL"; then
+          echo "::warning::Failed to add PR to org project #${PROJECT_NUMBER}. Check gh-project-token scope/expiry."
+          exit 1
+        fi
+
+    # -------------------------------------------------------------------
+    # Step 9: Linear issue.
+    # Skipped when linear-api-key is absent.
+    # All Linear IDs come from action inputs so they can be overridden
+    # per-caller if the workspace or project changes.
+    # -------------------------------------------------------------------
+    - name: Create Linear issue
+      if: >
+        steps.idempotency.outputs.already == 'false' &&
+        inputs.linear-api-key != '' &&
+        inputs.dry-run != 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        LINEAR_API_KEY:         ${{ inputs.linear-api-key }}
+        IS_SECURITY:            ${{ steps.security.outputs.detected }}
+        SEVERITY:               ${{ steps.security.outputs.severity }}
+        SLA:                    ${{ steps.security.outputs.sla }}
+        LINEAR_TEAM_ID:         ${{ inputs.linear-team-id }}
+        LINEAR_PROJECT_ID:      ${{ inputs.linear-project-id }}
+        LINEAR_INREVIEW_STATE:  ${{ inputs.linear-inreview-state-id }}
+        LINEAR_TODO_STATE:      ${{ inputs.linear-todo-state-id }}
+        LINEAR_ASSIGNEE_ID:     ${{ inputs.linear-assignee-id }}
+        PR_TITLE_FILE:          /tmp/pr_title.txt
+        PR_URL_FILE:            /tmp/pr_url.txt
+      run: python3 "$GITHUB_ACTION_PATH/scripts/create-linear-issue.py"
+
+    # -------------------------------------------------------------------
+    # Step 10: write the idempotency marker.
+    # Posted last so a partial failure can be retried via workflow_dispatch
+    # with force='true'.
+    # -------------------------------------------------------------------
+    - name: Post idempotency marker
+      if: steps.idempotency.outputs.already == 'false' && inputs.dry-run != 'true'
+      shell: bash
+      env:
+        GH_TOKEN:  ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+      run: |
+        gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+          -X POST \
+          -f body='<!-- dependabot-triage-applied --> Dependabot triage workflow complete.'
+
+    # -------------------------------------------------------------------
+    # Step 11: dry-run summary (when dry-run='true').
+    # -------------------------------------------------------------------
+    - name: Dry-run summary
+      if: inputs.dry-run == 'true'
+      shell: bash
+      env:
+        PR_NUMBER: ${{ inputs.pr-number }}
+      run: |
+        {
+          echo "### Dependabot triage dry-run for PR #${PR_NUMBER}"
+          echo ""
+          echo "| Field | Value |"
+          echo "|-------|-------|"
+          echo "| detected    | ${{ steps.security.outputs.detected }} |"
+          echo "| severity    | ${{ steps.security.outputs.severity }} |"
+          echo "| SLA         | ${{ steps.security.outputs.sla }} |"
+          echo "| GHSA count  | ${{ steps.security.outputs.count }} |"
+          echo "| already triaged | ${{ steps.idempotency.outputs.already }} |"
+          if [ -s /tmp/ghsa_ids.txt ]; then
+            echo ""
+            echo "GHSAs:"
+            sed 's/^/- /' /tmp/ghsa_ids.txt
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
