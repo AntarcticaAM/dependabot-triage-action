@@ -177,7 +177,7 @@ runs:
 
         GHSAS=$(printf '%s' "$BODY" \
           | grep -oiE 'GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}' \
-          | sort -u)
+          | sort -u || true)
         printf '%s\n' "$GHSAS" > /tmp/ghsa_ids.txt
         if [ -z "$GHSAS" ]; then
           COUNT=0
